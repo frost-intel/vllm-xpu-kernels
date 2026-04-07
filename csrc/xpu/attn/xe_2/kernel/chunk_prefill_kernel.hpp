@@ -258,25 +258,37 @@ class XeFMHAFwdKernel {
       int seq_coord =
           cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
-      // calc sg level seq_len_kv
+      // WG-tile-level Q row bounds (uniform across all subgroups in the WG).
+      // Used for computing k_block0 and k_blocks so that all subgroups execute
+      // the same number of K-loop iterations and therefore call
+      // barrier_arrive/barrier_wait the same number of times.
+      // Using per-SG seq_coord here would cause the loop bounds to diverge
+      // between subgroups, leading to a split-barrier deadlock on architectures
+      // with native hardware split barrier support (e.g. Xe2/BMG).
+      const int wg_q_start = blk_q * get<0>(TileShapeQK{});
+      const int wg_q_end   = wg_q_start + get<0>(TileShapeQK{});  // exclusive
+
+      // calc wg level seq_len_kv (covers the union of all SG windows)
       const int seq_len =
           CausalMask
               ? LocalMask
                     ? cute::min(
                           seq_len_kv,
-                          full_tile_offset + seq_coord + q_sg_tile +
+                          full_tile_offset + wg_q_end +
                               params.mainloop.local_right)
                     : cute::min(
-                          seq_len_kv, full_tile_offset + seq_coord + q_sg_tile)
+                          seq_len_kv, full_tile_offset + wg_q_end)
               : seq_len_kv;
       const int k_block0 =
           LocalMask
               ? cute::max(
-                    seq_coord + full_tile_offset - params.mainloop.local_left,
+                    wg_q_start + full_tile_offset - params.mainloop.local_left,
                     0) /
                     get<1>(TileShapeQK{})
               : 0;
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+      // k_blocks_causal is used only for per-work-item masking inside the loop,
+      // not for the loop bounds themselves, so per-SG seq_coord is fine here.
       const int k_blocks_causal =
           CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{})
                      : 0;
