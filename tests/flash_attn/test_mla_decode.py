@@ -137,7 +137,7 @@ def _mla_decode_via_varlen(
 
 
 # DeepSeek-V3 shapes: kv_lora_rank=512, qk_rope_head_dim=64.
-@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize(
     "query_lens,kv_lens",
     [
@@ -153,14 +153,16 @@ def test_mla_decode_deepseek_v3(block_size, query_lens, kv_lens, num_heads_q):
     kv_lora_rank = 512
     qk_rope_head_dim = 64
     head_size_qk = kv_lora_rank + qk_rope_head_dim
-    # SLM limits on Intel Xe restrict head_size_qk=576 to q_packed<=8
-    # (block_size only affects per-page tiling, not SLM). Larger configs are
-    # rejected by mha_varlen_fwd via TORCH_CHECK; covered by the rejection
-    # test below.
-    if head_size_qk > 512 and num_heads_q > 8:
+    # SLM limits on Intel Xe restrict head_size_qk=576 to q_packed<=8 when the
+    # KV block_size keeps the epilogue reduction buffer (kv_tile=_32/_64).
+    # block_size=16 dispatches through kv_tile=_16 (ReduceK==1 ->
+    # SharedStorageNone), which removes the buffer and lifts the limit. Larger
+    # configs on kv_tile=_64 are rejected by mha_varlen_fwd via TORCH_CHECK;
+    # covered by the rejection test below.
+    if head_size_qk > 512 and num_heads_q > 8 and block_size != 16:
         pytest.skip(
-            "MLA head_size=576 requires num_heads_q<=8 due to Intel Xe SLM "
-            "limits")
+            "MLA head_size=576 requires num_heads_q<=8 unless block_size==16 "
+            "(kv_tile=_16 removes the Intel Xe epilogue SLM buffer)")
     dtype = torch.bfloat16
 
     batch = len(query_lens)
@@ -202,8 +204,48 @@ def _call_with(num_heads_q, block_size):
 
 
 def test_mla_decode_rejects_large_q_packed():
-    """SLM-oversize configs must fail fast (not hang) for head_size=576."""
+    """SLM-oversize configs must fail fast (not hang) for head_size=576.
+
+    With kv_tile=_64 (block_size a multiple of 64) the epilogue reduction
+    buffer is present, so q_tile=16 (num_heads_q>8) exceeds the per-WG SLM
+    budget and must be rejected rather than hang.
+    """
     if not torch.xpu.is_available():
         pytest.skip("XPU not available")
-    with pytest.raises(RuntimeError, match="num_heads_q"):
+    with pytest.raises(RuntimeError, match="epilogue SLM"):
         _call_with(num_heads_q=16, block_size=64)
+
+
+@pytest.mark.parametrize("num_heads_q", [16, 32])
+def test_mla_decode_block16_allows_large_q_packed(num_heads_q):
+    """block_size=16 removes the epilogue SLM buffer (kv_tile=_16 ->
+    ReduceK==1), so head_size=576 runs with num_heads_q>8 -- e.g. DeepSeek-V3
+    at TP4 (128 heads / 4 = 32 heads per rank). Validate against reference.
+    """
+    if not torch.xpu.is_available():
+        pytest.skip("XPU not available")
+    kv_lora_rank, qk_rope_head_dim = 512, 64
+    block_size = 16
+    dtype = torch.bfloat16
+    query_lens = [1, 1]
+    kv_lens = [37, 512]
+    batch = len(query_lens)
+    num_blocks = max(256,
+                     (max(kv_lens) + block_size - 1) // block_size * batch * 2)
+
+    q_nope, q_pe, cache, cu_q, sk, bt = _make_inputs(
+        batch, query_lens, kv_lens, num_heads_q,
+        kv_lora_rank, qk_rope_head_dim, block_size, num_blocks, dtype)
+
+    softmax_scale = (kv_lora_rank + qk_rope_head_dim) ** -0.5
+
+    out = _mla_decode_via_varlen(
+        q_nope, q_pe, cache, bt, cu_q, sk,
+        max_seqlen_q=1, max_seqlen_k=max(kv_lens),
+        softmax_scale=softmax_scale,
+    )
+
+    ref = _ref_mla_decode(q_nope, q_pe, cache, bt, cu_q, sk,
+                          softmax_scale, causal=False)
+
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)

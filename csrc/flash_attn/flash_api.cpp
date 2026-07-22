@@ -344,23 +344,60 @@ std::vector<at::Tensor> mha_varlen_fwd(
 
     // SLM (shared local memory) limits on Intel Xe restrict the paged decode
     // kernel's epilogue cross-SG reduction buffer when head_size grows.
-    // The buffer size is q_packed * head_size_vo * SGPerWG * sizeof(float);
-    // with kv_tile=_64 (SGPerWG=4) and head_size_vo=512 (MLA), q_packed=8
-    // takes 64 KiB (fits) and q_packed=16 takes 128 KiB (exceeds the per-WG
-    // SLM cap and hangs at submit). All block_size that are multiples of 64
-    // dispatch through kv_tile=_64 so the SLM cost is independent of
-    // block_size; only q_packed needs to be guarded.
+    // The buffer size is q_tile * head_size_vo * SGPerWG * sizeof(float),
+    // where:
+    //   * q_tile is the packed-Q tile the dispatcher picks from the GQA ratio
+    //     (ratio <= 8 -> tile 8; ratio > 8 -> tile 16; larger ratios are
+    //     processed by ceil(ratio / q_tile) work-groups, see
+    //     paged_decode_xe2.cpp), and
+    //   * SGPerWG (== the epilogue cross-SG ReduceK) is fixed by kv_tile,
+    //     which is selected from block_size in paged_decode_utils.hpp:
+    //       block_size == 16 -> kv_tile _16 -> ReduceK == 1 -> the epilogue
+    //                           uses SharedStorageNone (no reduction buffer),
+    //       block_size == 32 -> kv_tile _32 -> SGPerWG == 2,
+    //       block_size % 64 == 0 -> kv_tile _64 -> SGPerWG == 4.
+    // With head_size_vo == 512 (MLA): kv_tile _64 fits q_tile 8 (64 KiB) but
+    // not q_tile 16 (128 KiB, which exceeds the per-WG budget and hangs at
+    // submit). A smaller KV block_size shrinks (16/32) or removes (16) the
+    // buffer, so larger q_tiles fit — this is what lets high-head-count MLA
+    // (e.g. DeepSeek-V3 at low tensor-parallel size) run.
     if (head_size_qk > 512) {
-      int q_packed =
-          num_heads_kv > 0 ? (num_heads_q / num_heads_kv) : num_heads_q;
+      int ratio = num_heads_kv > 0 ? (num_heads_q / num_heads_kv) : num_heads_q;
+      int q_tile = ratio <= 8 ? 8 : 16;
+      // SGPerWG driven by kv_tile; block_size == 16 removes the buffer.
+      int sg_per_wg;
+      if (block_size == 16) {
+        sg_per_wg = 0;  // ReduceK == 1 -> SharedStorageNone
+      } else if (block_size == 32) {
+        sg_per_wg = 2;
+      } else {
+        sg_per_wg = 4;  // any positive multiple of 64
+      }
+      // Per-WG budget available to the epilogue reduction buffer on Intel Xe.
+      // The known-good kv_tile _64 / q_tile 8 case is exactly 64 KiB, so use
+      // that as the ceiling (128 KiB is known to hang).
+      constexpr int64_t kEpilogueSlmBudgetBytes = 64 * 1024;
+      int64_t slm_bytes = static_cast<int64_t>(q_tile) * v_head_dim *
+                          sg_per_wg * static_cast<int64_t>(sizeof(float));
       TORCH_CHECK(
-          q_packed <= 8,
-          "paged decode: num_heads_q/num_heads_kv=",
-          q_packed,
-          " is not supported at head_size_qk=",
+          slm_bytes <= kEpilogueSlmBudgetBytes,
+          "paged decode: estimated epilogue SLM ",
+          slm_bytes,
+          " bytes (q_tile=",
+          q_tile,
+          ", head_size_vo=",
+          v_head_dim,
+          ", SGPerWG=",
+          sg_per_wg,
+          ", block_size=",
+          block_size,
+          ") exceeds the Intel Xe per-WG budget of ",
+          kEpilogueSlmBudgetBytes,
+          " bytes at head_size_qk=",
           head_size_qk,
-          " due to Intel Xe SLM limits (q_packed must be <= 8). Increase "
-          "tensor parallel size so num_heads_q per rank is <= 8.");
+          ". Use a smaller KV block_size (16 removes the buffer entirely, 32 "
+          "halves it) or increase tensor parallel size so num_heads_q per "
+          "rank is <= 8.");
     }
 
     // Output shape uses V's head_dim (may differ from Q/K for MLA)
