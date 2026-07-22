@@ -26,6 +26,10 @@ torch::Tensor cutlass_grouped_gemm_interface(
       ptr_B_scale.has_value() && ptr_B_scale->dim() == 3;
   if (vllm::xpu::force_xe_default_kernel()) {
 #ifdef VLLM_XPU_ENABLE_XE_DEFAULT
+    TORCH_CHECK(
+        !is_B_fp8block,
+        "Block-wise FP8 grouped gemm is not supported by the XE default "
+        "kernel.");
     int64_t groups = num_experts;
     return cutlass_grouped_gemm_xe_default(
         ptr_A, ptr_B, ptr_bias, ptr_D, rows_per_expert, N, K, groups);
@@ -53,6 +57,10 @@ torch::Tensor cutlass_grouped_gemm_interface(
 #endif
   } else {
 #ifdef VLLM_XPU_ENABLE_XE_DEFAULT
+    TORCH_CHECK(
+        !is_B_fp8block,
+        "Block-wise FP8 grouped gemm is not supported by the XE default "
+        "kernel.");
     int64_t groups = num_experts;
     return cutlass_grouped_gemm_xe_default(
         ptr_A, ptr_B, ptr_bias, ptr_D, rows_per_expert, N, K, groups);

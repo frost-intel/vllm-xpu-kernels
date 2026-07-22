@@ -46,7 +46,7 @@ def calculate_memory_usage(m, n, k, num_experts, x_dtype, w_dtype=None):
 
 
 def make_fused_moe_input(config):
-    mnk, e, topk, x_dtype, w_dtype, has_bias = config
+    mnk, e, topk, x_dtype, w_dtype, has_bias, is_block_fp8 = config
     m, n, k = mnk
     input_len = m
     hidden_size = k
@@ -84,7 +84,55 @@ def make_fused_moe_input(config):
     flat_expert_indices = expert_indices.view(-1)
     flat_expert_weights = expert_scores.view(-1, 1)
 
-    if w_dtype is not None:
+    if w_dtype is not None and is_block_fp8:
+        # 128x128 block-wise fp8 weights. Weights are laid out [E, N, K] here
+        # (natural orientation) and transposed to the kernel's [E, K, N] below,
+        # so the kernel scales are the transpose of the natural block grid
+        # [E, N // 128, K // 128] -> [E, K // 128, N // 128].
+        block_size = 128
+        n13 = 2 * intermediate_size
+        assert (hidden_size % block_size == 0
+                and intermediate_size % block_size == 0), \
+            "block fp8 requires hidden_size and intermediate_size " \
+            "divisible by 128"
+
+        w13_blk_scales = torch.pow(
+            2.0,
+            torch.randint(-3,
+                          4, (num_experts, n13 // block_size,
+                              hidden_size // block_size),
+                          device=DEVICE).float())
+        w2_blk_scales = torch.pow(
+            2.0,
+            torch.randint(-3,
+                          4, (num_experts, hidden_size // block_size,
+                              intermediate_size // block_size),
+                          device=DEVICE).float())
+
+        w13_fp8 = torch.empty_like(w13, dtype=w_dtype)
+        w2_fp8 = torch.empty_like(w2, dtype=w_dtype)
+        ref_w13 = torch.empty_like(w13, dtype=x_dtype)
+        ref_w2 = torch.empty_like(w2, dtype=x_dtype)
+        for i in range(num_experts):
+            # Quantize by dividing each 128x128 block by its scale before the
+            # fp8 cast (mirroring the per-tensor scaled_fp8_quant path), so the
+            # dequantized weight (fp8 * scale) reconstructs the original weight
+            # and output magnitudes stay in the same range as the bf16 / per-
+            # tensor reference.
+            s13 = w13_blk_scales[i].repeat_interleave(
+                block_size, dim=0).repeat_interleave(block_size, dim=1)
+            w13_fp8[i] = (w13[i] / s13).to(w_dtype)
+            ref_w13[i] = w13_fp8[i].to(x_dtype) * s13
+            s2 = w2_blk_scales[i].repeat_interleave(
+                block_size, dim=0).repeat_interleave(block_size, dim=1)
+            w2_fp8[i] = (w2[i] / s2).to(w_dtype)
+            ref_w2[i] = w2_fp8[i].to(x_dtype) * s2
+        w13 = w13_fp8
+        w2 = w2_fp8
+        # kernel scales: [E, K // 128, N // 128]
+        w13_scales = w13_blk_scales.transpose(1, 2).contiguous()
+        w2_scales = w2_blk_scales.transpose(1, 2).contiguous()
+    elif w_dtype is not None:
         w13_fp8 = torch.empty_like(w13, dtype=w_dtype)
         w2_fp8 = torch.empty_like(w2, dtype=w_dtype)
 
@@ -127,7 +175,7 @@ def make_fused_moe_input(config):
 
 
 def calculate_diff(config):
-    _, e, topk, x_dtype, w_dtype, _ = config
+    _, e, topk, x_dtype, w_dtype, _, is_block_fp8 = config
     ref_a, ref_w13, w13_bias, ref_w2, w2_bias, flat_expert_weights, \
         flat_expert_indices, a, w13, w13_scales, w2, w2_scales, \
             expert_scores, expert_indices = make_fused_moe_input(config)
@@ -170,7 +218,7 @@ def get_benchmark():
         triton.testing.Benchmark(
             x_names=[
                 "m", "n", "k", "num_experts", "topk", "x_dtype", "w_dtype",
-                "has_bias"
+                "has_bias", "is_block_fp8"
             ],
             x_vals=[(*tuple(c)[0], *tuple(c)[1:]) for c in configs],
             line_arg="provider",
@@ -204,10 +252,11 @@ def get_benchmark():
                   x_dtype,
                   w_dtype,
                   has_bias,
+                  is_block_fp8,
                   provider):
         print(f"Running config: {m, n, k, num_experts, topk, \
                                 x_dtype, w_dtype, \
-                                has_bias}, Provider: {provider}",
+                                has_bias, is_block_fp8}, Provider: {provider}",
               flush=True)
         total_latency = 0.0
         ms = 0.0
@@ -216,7 +265,7 @@ def get_benchmark():
             _, a, w13, w13_scales, w2, w2_scales, \
                 expert_scores, expert_indices = make_fused_moe_input(
                     config=((m, n, k), num_experts,
-                            topk, x_dtype, w_dtype, has_bias))
+                            topk, x_dtype, w_dtype, has_bias, is_block_fp8))
 
         if provider == "vllm":
             moe = XpuFusedMoe(w13=w13,
