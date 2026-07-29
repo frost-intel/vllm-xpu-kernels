@@ -548,6 +548,15 @@ if(BASIC_KERNELS_ENABLED)
       "csrc/topk_per_row.cpp")
   include_directories("/usr/include")
 
+  # The Level Zero device-usablemem-size extension
+  # (ze_device_usablemem_size_ext_properties_t) was added in Level Zero loader
+  # v1.27.0. Detect the installed loader version via pkg-config; older stacks
+  # fall back to total memory in mem_info.cpp.
+  find_package(PkgConfig)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LEVEL_ZERO libze_loader)
+  endif()
+
   define_gpu_extension_target(
     _C
     DESTINATION
@@ -567,6 +576,20 @@ if(BASIC_KERNELS_ENABLED)
     USE_SABI
     3
     WITH_SOABI)
+
+  if(LEVEL_ZERO_FOUND AND LEVEL_ZERO_VERSION VERSION_GREATER_EQUAL "1.27.0")
+    message(STATUS
+      "Level Zero ${LEVEL_ZERO_VERSION}: enabling device-usablemem-size extension.")
+    target_compile_definitions(_C PRIVATE VLLM_XPU_HAS_ZE_USABLEMEM=1)
+  elseif(LEVEL_ZERO_FOUND)
+    message(STATUS
+      "Level Zero ${LEVEL_ZERO_VERSION}: device-usablemem-size extension "
+      "unavailable (< 1.27.0); mem_info falls back to total memory.")
+  else()
+    message(STATUS
+      "Level Zero loader not found via pkg-config; mem_info falls back to "
+      "total memory.")
+  endif()
 
 endif()
 
