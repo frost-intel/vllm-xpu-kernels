@@ -295,7 +295,22 @@ void cutlass_paged_decode_impl(
   // a packed-Q tile size rather than a hard cap on the GQA ratio. Ratios <= 8
   // fit a single _8 tile; larger ratios (e.g. falcon-7b's 71 query heads / 1 KV
   // head) are processed by ceil(ratio / qgroup) work-groups using the _16 tile.
-  if (num_q_group_size <= 8) {
+  //
+  // At MLA head sizes (head_size_qk > 512) the _8 tile is faster despite the
+  // large GQA ratio: it doubles the number of work-groups along Q, which the
+  // low batch sizes of decode cannot otherwise fill.  Measured at seq=1100,
+  // 128 q-heads / 1 kv-head, auto splits, _16 -> _8 in us:
+  //
+  //   block_size 16:  426.2 -> 337.2 (b1), 914.1 -> 663.7 (b4),
+  //                  2724.1 -> 1728.7 (b16)   [1.26x / 1.38x / 1.58x]
+  //   block_size 32:  777.1 -> 451.1 (b1), 2370.3 -> 1093.7 (b4),
+  //                  7820.8 -> 2381.4 (b16)   [1.72x / 2.17x / 3.28x]
+  //
+  // _8 wins at every measured point and the outputs are bit-identical, so
+  // there is no configuration in which _16 is preferable here.  It also
+  // halves the epilogue SLM buffer, which is what lets block_size 64 pass
+  // the budget check in flash_api.cpp (keep the two rules in sync).
+  if (num_q_group_size <= 8 || args.head_size > 512) {
     dispatch_by_page_size<_8>(block_size, head_case, queue, cuQKType, args);
   } else {
     dispatch_by_page_size<_16>(block_size, head_case, queue, cuQKType, args);

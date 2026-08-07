@@ -203,17 +203,23 @@ def _call_with(num_heads_q, block_size):
     )
 
 
-def test_mla_decode_rejects_large_q_packed():
-    """SLM-oversize configs must fail fast (not hang) for head_size=576.
+def test_mla_decode_block64_allows_large_q_packed():
+    """block_size=64 runs at head_size=576 with num_heads_q>8.
 
-    With kv_tile=_64 (block_size a multiple of 64) the epilogue reduction
-    buffer is present, so q_tile=16 (num_heads_q>8) exceeds the per-WG SLM
-    budget and must be rejected rather than hang.
+    This used to be rejected: the dispatcher picked q_tile=16 whenever the GQA
+    ratio exceeded 8, and 16 * 512 * 4 SG * 4 B = 128 KiB overran the per-WG
+    SLM budget.  paged_decode_xe2.cpp now always picks q_tile=8 above
+    head_size_qk 512 -- which halves that to exactly 64 KiB and fits -- so the
+    config is legal.  (q_tile=8 is also 1.26-3.28x faster than q_tile=16 at
+    MLA shapes, so nothing is traded for the smaller buffer.)
+
+    The SLM check in flash_api.cpp is retained as a backstop for head_size_vo
+    above 512, which no shape reaches today.
     """
     if not torch.xpu.is_available():
         pytest.skip("XPU not available")
-    with pytest.raises(RuntimeError, match="epilogue SLM"):
-        _call_with(num_heads_q=16, block_size=64)
+    out = _call_with(num_heads_q=16, block_size=64)
+    assert torch.isfinite(out).all()
 
 
 @pytest.mark.parametrize("num_heads_q", [16, 32])
