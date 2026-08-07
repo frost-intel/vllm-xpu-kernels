@@ -346,24 +346,26 @@ std::vector<at::Tensor> mha_varlen_fwd(
     // kernel's epilogue cross-SG reduction buffer when head_size grows.
     // The buffer size is q_tile * head_size_vo * SGPerWG * sizeof(float),
     // where:
-    //   * q_tile is the packed-Q tile the dispatcher picks from the GQA ratio
-    //     (ratio <= 8 -> tile 8; ratio > 8 -> tile 16; larger ratios are
-    //     processed by ceil(ratio / q_tile) work-groups, see
-    //     paged_decode_xe2.cpp), and
+    //   * q_tile is the packed-Q tile the dispatcher picks.  Above
+    //     head_size_qk 512 it is always 8 regardless of the GQA ratio; larger
+    //     ratios are processed by ceil(ratio / 8) work-groups, see
+    //     paged_decode_xe2.cpp.  (The _8 tile also measured 1.26-3.28x faster
+    //     than _16 at MLA shapes, so nothing is traded away for the smaller
+    //     buffer.)
     //   * SGPerWG (== the epilogue cross-SG ReduceK) is fixed by kv_tile,
     //     which is selected from block_size in paged_decode_utils.hpp:
     //       block_size == 16 -> kv_tile _16 -> ReduceK == 1 -> the epilogue
     //                           uses SharedStorageNone (no reduction buffer),
     //       block_size == 32 -> kv_tile _32 -> SGPerWG == 2,
     //       block_size % 64 == 0 -> kv_tile _64 -> SGPerWG == 4.
-    // With head_size_vo == 512 (MLA): kv_tile _64 fits q_tile 8 (64 KiB) but
-    // not q_tile 16 (128 KiB, which exceeds the per-WG budget and hangs at
-    // submit). A smaller KV block_size shrinks (16/32) or removes (16) the
-    // buffer, so larger q_tiles fit — this is what lets high-head-count MLA
-    // (e.g. DeepSeek-V3 at low tensor-parallel size) run.
+    // With head_size_vo == 512 (MLA) the worst case is kv_tile _64 at
+    // q_tile 8: exactly 64 KiB, which fits.  q_tile 16 would be 128 KiB and
+    // hangs at submit, but the dispatcher no longer produces it here, so this
+    // check is now a backstop for head_size_vo above 512.
     if (head_size_qk > 512) {
-      int ratio = num_heads_kv > 0 ? (num_heads_q / num_heads_kv) : num_heads_q;
-      int q_tile = ratio <= 8 ? 8 : 16;
+      // paged_decode_xe2.cpp always picks the _8 tile above head_size_qk 512
+      // (it is both faster and half the SLM), so mirror that rule here.
+      constexpr int q_tile = 8;
       // SGPerWG driven by kv_tile; block_size == 16 removes the buffer.
       int sg_per_wg;
       if (block_size == 16) {
