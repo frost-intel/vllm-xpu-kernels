@@ -251,22 +251,21 @@ struct chunk_policy_head512_b16 {
 // the runtime head_size_vo, which differs for MLA (head_size_qk 576 with
 // head_size_vo 512).
 static constexpr int kDecodeMaxShapeOutV = 256;
+
 static constexpr int kDecodeAccBudget = 2048;
 
-template <typename q_packed, typename head_dim>
-constexpr int decode_shapeout_v_value() {
-  if constexpr (head_dim::value <= kDecodeMaxShapeOutV) {
-    return head_dim::value;
-  } else {
-    constexpr int budgeted = kDecodeAccBudget / q_packed::value;
-    return budgeted < kDecodeMaxShapeOutV ? budgeted : kDecodeMaxShapeOutV;
-  }
+constexpr int decode_shapeout_v_value(int q_packed, int head_dim) {
+  if (head_dim <= kDecodeMaxShapeOutV) return head_dim;
+  const int budgeted = kDecodeAccBudget / q_packed;
+  return budgeted < kDecodeMaxShapeOutV ? budgeted : kDecodeMaxShapeOutV;
 }
 
 template <typename q_packed, typename head_dim>
 using decode_shapeout_v =
-    cute::Int<decode_shapeout_v_value<q_packed, head_dim>()>;
+    cute::Int<decode_shapeout_v_value(q_packed::value, head_dim::value)>;
 
+// Subgroups split the V (N) dimension of P*V instead of the kv (K) dimension;
+// see decode_policy_kv64_splitv below.
 template <typename q_packed, typename head_dim, typename kv_tile>
 struct decode_policy_qpacked_head {
   static_assert(
@@ -284,6 +283,7 @@ struct decode_policy_qpacked_head<q_packed, head_dim, _16> {
   using ShapePV = Shape<q_packed, _32, _16>;
   using ShapeOut = Shape<q_packed, decode_shapeout_v<q_packed, head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _1, _1>>;
+  using SubgroupLayoutPV = void;
 };
 
 // kv_tile == _32 (block_size == 32)
@@ -294,6 +294,7 @@ struct decode_policy_qpacked_head<q_packed, head_dim, _32> {
   using ShapePV = Shape<q_packed, _32, _32>;
   using ShapeOut = Shape<q_packed, decode_shapeout_v<q_packed, head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _2, _1>>;
+  using SubgroupLayoutPV = void;
 };
 
 // kv_tile == _64
@@ -301,13 +302,66 @@ struct decode_policy_qpacked_head<q_packed, head_dim, _32> {
 // (e.g. 64, 128, 192, 256, 320, ...). The mainloop iterates
 // page_size / 64 sub-tiles per page via the page-table indirection.
 template <typename q_packed, typename head_dim>
-struct decode_policy_qpacked_head<q_packed, head_dim, _64> {
+struct decode_policy_kv64_default {
   using HeadDim = head_dim;
   using ShapeQK = Shape<q_packed, _64, _64>;
   using ShapePV = Shape<q_packed, _32, _64>;
   using ShapeOut = Shape<q_packed, decode_shapeout_v<q_packed, head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+  using SubgroupLayoutPV = void;
 };
+
+// Subgroups per split-V work-group, and the V width of one ShapePV tile. The
+// static_asserts in the policy below keep these in step with it.
+static constexpr int kDecodeSplitVSubgroups = 4;
+static constexpr int kDecodeSplitVTileV = 128;
+
+// V extent owned by one work-group when subgroups split V: the same
+// accumulator budget as the default policy, shared across the subgroups now
+// splitting V, floored to a whole number of ShapePV V-tiles.
+//
+// The cap is head_dim, the Q/K bucket, so for MLA it is not what bounds the
+// result: 576 exceeds the 512-wide V the shape really has, and it is the floor
+// to a whole 128-wide tile that brings it back to exactly 512.
+constexpr int decode_splitv_shapeout_v_value(int q_packed, int head_dim) {
+  const int budgeted = kDecodeSplitVSubgroups * kDecodeAccBudget / q_packed;
+  const int capped = budgeted < head_dim ? budgeted : head_dim;
+  return (capped / kDecodeSplitVTileV) * kDecodeSplitVTileV;
+}
+
+// Subgroups split the V (N) dimension of P*V instead of the kv (K) dimension.
+// Each subgroup owns a disjoint V slice and needs the whole P tile, which the
+// mainloop exchanges through SLM every KV tile. In return one work-group owns
+// the entire V extent, so K is read once per work-group instead of once per V
+// split, and the epilogue's cross-subgroup reduction disappears.
+//
+// Only the xe_2 mainloop implements that SLM exchange, so this policy is never
+// reached through decode_policy_qpacked_head; the xe_2 dispatcher names it
+// explicitly (see xe_2/paged_decode.hpp).
+template <typename q_packed, typename head_dim>
+struct decode_policy_kv64_splitv {
+  using HeadDim = head_dim;
+  using ShapeQK = Shape<q_packed, _64, _64>;
+  using ShapePV = Shape<q_packed, _128, _64>;
+  using ShapeOut = Shape<
+      q_packed,
+      cute::Int<decode_splitv_shapeout_v_value(
+          q_packed::value,
+          head_dim::value)>>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+  using SubgroupLayoutPV = Layout<Shape<_1, _4, _1>>;
+
+  static_assert(
+      size<1>(SubgroupLayoutPV{}) == kDecodeSplitVSubgroups,
+      "kDecodeSplitVSubgroups must equal SubgroupLayoutPV's N extent");
+  static_assert(
+      size<1>(ShapePV{}) == kDecodeSplitVTileV,
+      "kDecodeSplitVTileV must equal ShapePV's V extent");
+};
+
+template <typename q_packed, typename head_dim>
+struct decode_policy_qpacked_head<q_packed, head_dim, _64>
+    : decode_policy_kv64_default<q_packed, head_dim> {};
 
 // kv_tile == _128
 // NOTE: Currently UNUSED. The dispatcher in paged_decode_utils.hpp routes
@@ -324,4 +378,5 @@ struct decode_policy_qpacked_head<q_packed, head_dim, _128> {
   using ShapePV = Shape<q_packed, _32, _128>;
   using ShapeOut = Shape<q_packed, decode_shapeout_v<q_packed, head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _8, _1>>;
+  using SubgroupLayoutPV = void;
 };
