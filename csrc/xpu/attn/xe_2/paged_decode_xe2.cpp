@@ -313,7 +313,33 @@ void cutlass_paged_decode_impl(
   // a packed-Q tile size rather than a hard cap on the GQA ratio. Ratios <= 8
   // fit a single _8 tile; larger ratios (e.g. falcon-7b's 71 query heads / 1 KV
   // head) are processed by ceil(ratio / qgroup) work-groups using the _16 tile.
-  if (num_q_group_size <= 8) {
+  //
+  // At MLA head sizes split-V collapses grid.x (decode_policy_kv64_splitv), so
+  // the wider _16 tile only pays once the batch supplies enough work-groups to
+  // fill the machine; below that the _8 tile's extra Q work-groups win.
+  // Conditioned on the same shape and page size that select that policy.
+  // The batch-4 threshold is empirical, tuned on PVC; other Xe2 parts have not
+  // been characterised separately and take the same value.
+  const bool splits_v = args.head_size > HEAD_SIZE_LIMIT_5 &&
+                        block_size > 0 && (block_size % 64) == 0;
+
+  // The policy sizes its output tile from head_size (the Q/K bucket), not from
+  // v_head_size, and only lands on the real V width because 576 floors to 512.
+  // A 576-bucket shape with a different V extent would silently mis-size it.
+  TORCH_CHECK(
+      !splits_v || args.v_head_size == kSplitVExpectedShapeOutV,
+      "split-V decode expects head_size_vo == ",
+      kSplitVExpectedShapeOutV,
+      ", got ",
+      args.v_head_size,
+      " (head_size_qk=",
+      args.head_size,
+      ")");
+
+  const bool use_q8 =
+      num_q_group_size <= 8 || (splits_v && args.batch_size < 4);
+
+  if (use_q8) {
     dispatch_by_page_size<_8>(block_size, head_case, queue, cuQKType, args);
   } else {
     dispatch_by_page_size<_16>(block_size, head_case, queue, cuQKType, args);

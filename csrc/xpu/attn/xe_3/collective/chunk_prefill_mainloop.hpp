@@ -69,6 +69,8 @@ static inline void sbarrier_signal() { asm volatile("sbarrier.signal\n"); }
 
 static inline void gfence() { asm volatile("lsc_fence.ugm.none.group\n"); }
 
+// No "memory" clobber: this orders the hardware, not the compiler. Safe only
+// while no caller touches SLM inside the loop it closes.
 static inline void barrier() {
   asm volatile("lsc_fence.ugm.none.group\n");
   asm volatile("barrier\n");

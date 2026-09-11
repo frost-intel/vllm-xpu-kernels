@@ -362,11 +362,11 @@ std::vector<at::Tensor> mha_varlen_fwd(
     // be restricted to q_packed <= 8 here. The paged decode epilogue's
     // cross-SG SLM reduction buffer is q_packed * ShapeOut_V * SGPerWG *
     // sizeof(float), and with a full-width V tile q_packed=16 asked for
-    // 128 KiB, which exceeds the per-WG SLM cap and hung at submit. The
-    // decode policies now cap ShapeOut_V at 256 and split V across grid.x
-    // (see decode_shapeout_v in fmha_utils.hpp), so with kv_tile=_64
-    // (SGPerWG=4) q_packed=16 needs only 64 KiB and the guard is no longer
-    // required.
+    // 128 KiB, which exceeds the per-WG SLM cap and hung at submit. The decode
+    // policies now cap ShapeOut_V (see decode_shapeout_v in fmha_utils.hpp),
+    // and MLA at kv_tile=_64 uses decode_policy_kv64_splitv, which owns the
+    // whole V extent in one work-group and so has no cross-SG reduction buffer
+    // at all. Either way q_packed=16 fits and the guard is no longer required.
 
     // Output shape uses V's head_dim (may differ from Q/K for MLA).
     // For fp8 query the output cannot be fp8; default to fp16 (matches the

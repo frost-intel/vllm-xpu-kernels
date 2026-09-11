@@ -180,9 +180,8 @@ def _kv_tile_from_block_size(block_size: int) -> int:
 
 
 def _min_blocks_for_split(kv_tile: int) -> int:
-    # Mirror of XeFMHAFwdSplitKVKernel::kMinBlocksForSplit /
-    # ReduceSplitK::kMinBlocksForSplit. Below this threshold a sequence is
-    # processed as a single split for numerical stability.
+    # Floor for the default decode policies. Deliberately not a mirror of every
+    # policy -- see build_decode_split_plan's docstring.
     return 32 if kv_tile <= 64 else 128
 
 
@@ -241,6 +240,18 @@ def build_decode_split_plan(
       buffer indexing is safe)
     - splits_per_seq[i] folds in {single-split heuristic, balanced
       assignment, hard cap}; the kernel never needs to second-guess it.
+
+    Split floor
+    -----------
+    Supplying a plan makes this function authoritative: the kernel takes its
+    plan-driven branch and skips its own kMinBlocksForSplit entirely. The floor
+    applied here (_min_blocks_for_split) is the one the default decode policies
+    use. It is not a mirror of every policy -- xe_2 runs MLA at kv_tile 64 on
+    decode_policy_kv64_splitv, whose kernel-side floor is 2 -- because this
+    function cannot tell xe_2 from xe_3 and xe_3 has no split-V, so applying 2
+    unconditionally would over-split there. Callers that want split-V's lower
+    floor should pass seqused_k instead and let the device decide. Threading
+    head_size_qk and the target architecture through would let the two agree.
     """
     if isinstance(kv_lens, torch.Tensor):
         kv_lens_list = kv_lens.to(dtype=torch.int32, device="cpu").tolist()
