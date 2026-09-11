@@ -42,6 +42,16 @@
 #include "csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp"
 #include "csrc/xpu/attn/xe_2/collective/chunk_prefill_epilogue.hpp"
 
+// Device code cannot read the environment, so this floor stays compile-time.
+// It is set low deliberately: get_num_splits() applies the real threshold host
+// side (VLLM_MIN_BLOCKS_FOR_SPLIT), and this only has to stay out of its way.
+#ifndef VLLM_MIN_BLOCKS_FOR_SPLIT_64
+  #define VLLM_MIN_BLOCKS_FOR_SPLIT_64 2
+#endif
+#ifndef VLLM_MIN_BLOCKS_FOR_SPLIT_128
+  #define VLLM_MIN_BLOCKS_FOR_SPLIT_128 8
+#endif
+
 namespace cutlass::fmha::kernel {
 // Arch-tagged inline namespace: gives these definitions a mangled name
 // distinct from the other Xe architecture's identically named copies,
@@ -383,7 +393,9 @@ class XeFMHAFwdSplitKVKernel {
             cute::ceil_div(windowed_k_blocks, seq_num_kv_splits);
 
         constexpr int tile_n = get<1>(TileShapeQK{});
-        constexpr int kMinBlocksForSplit = (tile_n <= 64) ? 32 : 128;
+        constexpr int kMinBlocksForSplit = (tile_n <= 64)
+                                               ? VLLM_MIN_BLOCKS_FOR_SPLIT_64
+                                               : VLLM_MIN_BLOCKS_FOR_SPLIT_128;
         is_single_split =
             (seq_num_kv_splits > 1) && (windowed_k_blocks < kMinBlocksForSplit);
 
@@ -740,7 +752,9 @@ class ReduceSplitK {
         effective_splits = seq_num_kv_splits;
       } else {
         constexpr int tile_n = get<1>(typename FMHAKernel_::TileShapeQK{});
-        constexpr int kMinBlocksForSplit = (tile_n <= 64) ? 32 : 128;
+        constexpr int kMinBlocksForSplit = (tile_n <= 64)
+                                               ? VLLM_MIN_BLOCKS_FOR_SPLIT_64
+                                               : VLLM_MIN_BLOCKS_FOR_SPLIT_128;
         bool is_single_split =
             (seq_num_kv_splits > 1) && (windowed_k_blocks < kMinBlocksForSplit);
         effective_splits = is_single_split ? 1 : seq_num_kv_splits;

@@ -7,7 +7,10 @@
   #include "paged_decode_extern.hpp"
 #endif
 
+#include <cstdlib>
+
 namespace vllm::xpu::xe2 {
+
 using namespace cute;
 
 void cutlass_paged_decode_xe2(
@@ -313,7 +316,27 @@ void cutlass_paged_decode_impl(
   // a packed-Q tile size rather than a hard cap on the GQA ratio. Ratios <= 8
   // fit a single _8 tile; larger ratios (e.g. falcon-7b's 71 query heads / 1 KV
   // head) are processed by ceil(ratio / qgroup) work-groups using the _16 tile.
-  if (num_q_group_size <= 8) {
+  //
+  // At MLA head sizes (head_size_qk > 512) the _8 tile doubles the number of
+  // work-groups along Q, which the low batch sizes of decode cannot otherwise
+  // fill.  This was a large win before the V-split landed; against the current
+  // split it is still being re-measured per page size, so the rule is
+  // overridable below rather than settled.
+  bool use_q8 = num_q_group_size <= 8 || args.head_size > 512;
+
+  // Temporary experiment knob so one build can measure both tiles; remove once
+  // the head_size > 512 rule above is settled.
+  static const int q_tile_override = [] {
+    const char* env = std::getenv("VLLM_MLA_Q_TILE");
+    return env ? std::atoi(env) : 0;
+  }();
+  if (q_tile_override == 8) {
+    use_q8 = true;
+  } else if (q_tile_override == 16 && num_q_group_size > 8) {
+    use_q8 = false;
+  }
+
+  if (use_q8) {
     dispatch_by_page_size<_8>(block_size, head_case, queue, cuQKType, args);
   } else {
     dispatch_by_page_size<_16>(block_size, head_case, queue, cuQKType, args);

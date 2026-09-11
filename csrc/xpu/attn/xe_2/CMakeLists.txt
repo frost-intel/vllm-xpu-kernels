@@ -8,3 +8,7 @@ include("paged_decode_configure.cmake")
 paged_decode_configure(paged_decode_kernel_template)
 
 add_xe2_kernel_library(attn_kernels_xe_2 INCLUDE_CMAKE_SOURCE_DIR)
+
+# Split-V is implemented by this mainloop only; see decode_split_config.h.
+target_compile_definitions(attn_kernels_xe_2
+                           PRIVATE -DVLLM_DECODE_SPLIT_V_SUPPORTED=1)

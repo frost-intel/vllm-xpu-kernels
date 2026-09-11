@@ -15,6 +15,10 @@
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 #ifndef VLLM_GRF_SIZE
   #define VLLM_GRF_SIZE 256
 #endif
@@ -80,12 +84,14 @@ using decode_policy_q8_h128_p16 = decode_policy_qpacked_head<_8, _128, _16>;
 using decode_policy_q8_h192_p16 = decode_policy_qpacked_head<_8, _192, _16>;
 using decode_policy_q8_h256_p16 = decode_policy_qpacked_head<_8, _256, _16>;
 using decode_policy_q8_h512_p16 = decode_policy_qpacked_head<_8, _512, _16>;
+using decode_policy_q8_h576_p16 = decode_policy_qpacked_head<_8, _576, _16>;
 using decode_policy_q16_h64_p16 = decode_policy_qpacked_head<_16, _64, _16>;
 using decode_policy_q16_h96_p16 = decode_policy_qpacked_head<_16, _96, _16>;
 using decode_policy_q16_h128_p16 = decode_policy_qpacked_head<_16, _128, _16>;
 using decode_policy_q16_h192_p16 = decode_policy_qpacked_head<_16, _192, _16>;
 using decode_policy_q16_h256_p16 = decode_policy_qpacked_head<_16, _256, _16>;
 using decode_policy_q16_h512_p16 = decode_policy_qpacked_head<_16, _512, _16>;
+using decode_policy_q16_h576_p16 = decode_policy_qpacked_head<_16, _576, _16>;
 
 // page_size = 32
 using decode_policy_q8_h64_p32 = decode_policy_qpacked_head<_8, _64, _32>;
@@ -94,12 +100,14 @@ using decode_policy_q8_h128_p32 = decode_policy_qpacked_head<_8, _128, _32>;
 using decode_policy_q8_h192_p32 = decode_policy_qpacked_head<_8, _192, _32>;
 using decode_policy_q8_h256_p32 = decode_policy_qpacked_head<_8, _256, _32>;
 using decode_policy_q8_h512_p32 = decode_policy_qpacked_head<_8, _512, _32>;
+using decode_policy_q8_h576_p32 = decode_policy_qpacked_head<_8, _576, _32>;
 using decode_policy_q16_h64_p32 = decode_policy_qpacked_head<_16, _64, _32>;
 using decode_policy_q16_h96_p32 = decode_policy_qpacked_head<_16, _96, _32>;
 using decode_policy_q16_h128_p32 = decode_policy_qpacked_head<_16, _128, _32>;
 using decode_policy_q16_h192_p32 = decode_policy_qpacked_head<_16, _192, _32>;
 using decode_policy_q16_h256_p32 = decode_policy_qpacked_head<_16, _256, _32>;
 using decode_policy_q16_h512_p32 = decode_policy_qpacked_head<_16, _512, _32>;
+using decode_policy_q16_h576_p32 = decode_policy_qpacked_head<_16, _576, _32>;
 
 struct paged_decode_args_t {
   void* query;
@@ -432,6 +440,28 @@ struct DecodeKernelLauncher {
     // configure smem size and carveout
     int smem_size = FMHAKernel::SharedStorageSize;
 
+    // VLLM_MLA_DUMP_SMEM=1: report per-WG SLM so the occupancy ceiling can be
+    // attributed (PVC has 128 KiB of SLM per Xe core).
+    if (std::getenv("VLLM_MLA_DUMP_SMEM")) {
+      static std::atomic<bool> dumped{false};
+      if (!dumped.exchange(true)) {
+        fprintf(
+            stderr,
+            "[MLA] SLM/WG: mainloop=%zu epilogue=%zu union=%d B "
+            "| reduce=%d B | block=%dx%dx%d grid=%dx%dx%d\n",
+            sizeof(typename FMHAKernel::MainloopSharedStorage),
+            sizeof(typename FMHAKernel::EpilogueSharedStorage),
+            smem_size,
+            int(ReductionSplitKernel::SharedStorageSize),
+            block.x,
+            block.y,
+            block.z,
+            grid.x,
+            grid.y,
+            grid.z);
+      }
+    }
+
     const auto sycl_block = compat::dim3(block.x, block.y, block.z);
     const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
 
@@ -447,8 +477,6 @@ struct DecodeKernelLauncher {
         sycl_grid, sycl_block, launch_props, kernel_props};
     compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
         policy, queue, params);
-
-    // event.wait();
 
     if (need_reduce) {
       dim3 const reduce_grid =
@@ -469,7 +497,6 @@ struct DecodeKernelLauncher {
       compat::experimental::launch<
           cutlass::device_kernel<ReductionSplitKernel>>(
           reduce_policy, queue, reduce_params);
-      // reduce_event.wait();
     }
   }
 };
@@ -609,7 +636,7 @@ void decode_policy_dispatch_impl(
           typename decode_policy::ShapePV,
           typename decode_policy::ShapeOut,
           typename decode_policy::SubgroupLayoutQK,
-          void,
+          typename decode_policy::SubgroupLayoutPV,
           PipelineStages,
           Causal,
           Local,
@@ -624,7 +651,7 @@ void decode_policy_dispatch_impl(
           typename decode_policy::ShapePV,
           typename decode_policy::ShapeOut,
           typename decode_policy::SubgroupLayoutQK,
-          void,
+          typename decode_policy::SubgroupLayoutPV,
           PipelineStages,
           Causal,
           Local,
@@ -639,7 +666,7 @@ void decode_policy_dispatch_impl(
           typename decode_policy::ShapePV,
           typename decode_policy::ShapeOut,
           typename decode_policy::SubgroupLayoutQK,
-          void,
+          typename decode_policy::SubgroupLayoutPV,
           PipelineStages,
           Causal,
           Local,
@@ -656,7 +683,7 @@ void decode_policy_dispatch_impl(
           typename decode_policy::ShapePV,
           typename decode_policy::ShapeOut,
           typename decode_policy::SubgroupLayoutQK,
-          void,
+          typename decode_policy::SubgroupLayoutPV,
           PipelineStages,
           Causal,
           Local,
@@ -671,7 +698,7 @@ void decode_policy_dispatch_impl(
           typename decode_policy::ShapePV,
           typename decode_policy::ShapeOut,
           typename decode_policy::SubgroupLayoutQK,
-          void,
+          typename decode_policy::SubgroupLayoutPV,
           PipelineStages,
           Causal,
           Local,
@@ -686,7 +713,7 @@ void decode_policy_dispatch_impl(
           typename decode_policy::ShapePV,
           typename decode_policy::ShapeOut,
           typename decode_policy::SubgroupLayoutQK,
-          void,
+          typename decode_policy::SubgroupLayoutPV,
           PipelineStages,
           Causal,
           Local,

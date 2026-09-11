@@ -1,5 +1,6 @@
 #pragma once
 #include "xpu/attn/paged_kv_utils.h"
+#include "xpu/attn/decode_split_config.h"
 #include "torch/all.h"
 #include <cute/tensor.hpp>
 
@@ -250,23 +251,24 @@ struct chunk_policy_head512_b16 {
 // Note head_dim here is the *Q/K* head size bucket; the V split is driven by
 // the runtime head_size_vo, which differs for MLA (head_size_qk 576 with
 // head_size_vo 512).
-static constexpr int kDecodeMaxShapeOutV = 256;
-static constexpr int kDecodeAccBudget = 2048;
+static constexpr int kDecodeMaxShapeOutV = vllm_xpu::kDecodeMaxShapeOutV;
+
+// Also sets SLM per work-group: the epilogue reduction buffer is
+// kDecodeAccBudget * SGPerWG * sizeof(float) + 512 B, so at 2048 each WG takes
+// 32.5 KiB of PVC's 128 KiB per Xe core -> 3 WGs/core -> 18.75% occupancy cap.
+static constexpr int kDecodeAccBudget = vllm_xpu::kDecodeAccBudget;
 
 template <typename q_packed, typename head_dim>
 constexpr int decode_shapeout_v_value() {
-  if constexpr (head_dim::value <= kDecodeMaxShapeOutV) {
-    return head_dim::value;
-  } else {
-    constexpr int budgeted = kDecodeAccBudget / q_packed::value;
-    return budgeted < kDecodeMaxShapeOutV ? budgeted : kDecodeMaxShapeOutV;
-  }
+  return vllm_xpu::decode_shapeout_v(q_packed::value, head_dim::value);
 }
 
 template <typename q_packed, typename head_dim>
 using decode_shapeout_v =
     cute::Int<decode_shapeout_v_value<q_packed, head_dim>()>;
 
+// Subgroups split the V (N) dimension of P*V instead of the kv (K) dimension;
+// see decode_split_config.h for the knobs and the rationale.
 template <typename q_packed, typename head_dim, typename kv_tile>
 struct decode_policy_qpacked_head {
   static_assert(
@@ -284,6 +286,7 @@ struct decode_policy_qpacked_head<q_packed, head_dim, _16> {
   using ShapePV = Shape<q_packed, _32, _16>;
   using ShapeOut = Shape<q_packed, decode_shapeout_v<q_packed, head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _1, _1>>;
+  using SubgroupLayoutPV = void;
 };
 
 // kv_tile == _32 (block_size == 32)
@@ -294,6 +297,7 @@ struct decode_policy_qpacked_head<q_packed, head_dim, _32> {
   using ShapePV = Shape<q_packed, _32, _32>;
   using ShapeOut = Shape<q_packed, decode_shapeout_v<q_packed, head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _2, _1>>;
+  using SubgroupLayoutPV = void;
 };
 
 // kv_tile == _64
@@ -301,13 +305,40 @@ struct decode_policy_qpacked_head<q_packed, head_dim, _32> {
 // (e.g. 64, 128, 192, 256, 320, ...). The mainloop iterates
 // page_size / 64 sub-tiles per page via the page-table indirection.
 template <typename q_packed, typename head_dim>
-struct decode_policy_qpacked_head<q_packed, head_dim, _64> {
+struct decode_policy_kv64_default {
   using HeadDim = head_dim;
   using ShapeQK = Shape<q_packed, _64, _64>;
   using ShapePV = Shape<q_packed, _32, _64>;
   using ShapeOut = Shape<q_packed, decode_shapeout_v<q_packed, head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+  using SubgroupLayoutPV = void;
 };
+
+// V extent owned by one work-group when subgroups split V. Bounded by the same
+// per-subgroup accumulator budget as the default policy, times the 4 subgroups
+// now sharing it, and floored to a whole number of ShapePV V-tiles (128).
+template <typename q_packed, typename head_dim>
+constexpr int decode_splitv_shapeout_v_value() {
+  return vllm_xpu::decode_splitv_shapeout_v(q_packed::value, head_dim::value);
+}
+
+template <typename q_packed, typename head_dim>
+struct decode_policy_kv64_splitv {
+  using HeadDim = head_dim;
+  using ShapeQK = Shape<q_packed, _64, _64>;
+  using ShapePV = Shape<q_packed, _128, _64>;
+  using ShapeOut =
+      Shape<q_packed, cute::Int<decode_splitv_shapeout_v_value<q_packed, head_dim>()>>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+  using SubgroupLayoutPV = Layout<Shape<_1, _4, _1>>;
+};
+
+template <typename q_packed, typename head_dim>
+struct decode_policy_qpacked_head<q_packed, head_dim, _64>
+    : cute::conditional_t<
+          vllm_xpu::decode_policy_splits_v(head_dim::value),
+          decode_policy_kv64_splitv<q_packed, head_dim>,
+          decode_policy_kv64_default<q_packed, head_dim>> {};
 
 // kv_tile == _128
 // NOTE: Currently UNUSED. The dispatcher in paged_decode_utils.hpp routes
@@ -324,4 +355,5 @@ struct decode_policy_qpacked_head<q_packed, head_dim, _128> {
   using ShapePV = Shape<q_packed, _32, _128>;
   using ShapeOut = Shape<q_packed, decode_shapeout_v<q_packed, head_dim>>;
   using SubgroupLayoutQK = Layout<Shape<_1, _8, _1>>;
+  using SubgroupLayoutPV = void;
 };

@@ -3,8 +3,12 @@
 #include "core/registration.h"
 #include "xpu/attn/attn_interface.h"
 #include "xpu/attn/paged_kv_utils.h"
+#include "xpu/attn/decode_split_config.h"
 #include "utils.h"
 #include <torch/all.h>
+
+#include <cstdio>
+#include <cstdlib>
 
 namespace FLASH_NAMESPACE {
 
@@ -14,7 +18,9 @@ inline int get_num_splits(
     const int& num_heads_q,
     const int& num_heads_kv,
     const int& max_seqlen_k,
-    const int& block_size) {
+    const int& block_size,
+    const int& head_size_qk,
+    const int& v_head_dim) {
   auto device = queue.get_device();
   int num_xe_cores =
       device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
@@ -49,11 +55,32 @@ inline int get_num_splits(
     policy_split_cap = 16;
   }
 
+  // Probe build only: report the core count the heuristic actually sees, since
+  // it is not what SYCL reports as max_compute_units.
+  static const int reported_xe_cores = [&] {
+    std::fprintf(stderr, "[vllm-xpu] num_xe_cores=%d (gpu_slices * gpu_subslices_per_slice)\n", num_xe_cores);
+    return num_xe_cores;
+  }();
+  (void)reported_xe_cores;
+
+  // Measurement override: the seqused path ignores num_splits_kv, so this is
+  // the only way to sweep split counts against a fixed heuristic.
+  static const int forced_splits = [] {
+    const char* env = std::getenv("VLLM_DECODE_SPLITS");
+    return env ? std::atoi(env) : 0;
+  }();
+  if (forced_splits > 0) return std::min(forced_splits, policy_split_cap);
+
   int kv_tiles = (max_seqlen_k + kv_tile - 1) / kv_tile;
 
-  // Below ~16 tiles total the kernel falls back to single-split anyway; any
-  // splitting only adds ReduceSplitK overhead.
-  if (kv_tiles < 16) return 1;
+  // Effective single-split floor. The kernel's compile-time guard is set low,
+  // so this is what actually decides when splitting is allowed: 32 reproduces
+  // shipping behaviour, 8 is the proposed value.
+  static const int min_blocks_for_split = [] {
+    const char* env = std::getenv("VLLM_MIN_BLOCKS_FOR_SPLIT");
+    int v = env ? std::atoi(env) : 0;
+    return v > 0 ? v : 8;
+  }();
 
   // Effective number of WG slots on the GPU.  Each Xe core hosts up to
   // (4 / sg_per_wg) decode WGs concurrently (4 SGs per Xe core at sg_size=16
@@ -61,7 +88,40 @@ inline int get_num_splits(
   // pack more WGs per core).
   int num_wg_slots = num_xe_cores * 4 / sg_per_wg;
 
-  int wgs_per_split = batch_size * num_heads_kv;
+  // The decode grid is grid.x * grid.y * grid.z, not just batch_size:
+  //   grid.x = ceil(v_head_dim / shapeout_v)              V split
+  //   grid.y = num_heads_kv * ceil(gqa_ratio / q_packed)  Q tiles
+  //   grid.z = batch_size * splits
+  // (fmha_utils.hpp decode_policy_qpacked_head / decode_shapeout_v, and the
+  // q_packed rule in paged_decode_xe2.cpp). Counting only batch_size
+  // understates the work-group count by grid.x * grid.y -- 32x for MLA at TP1.
+  static const bool use_legacy_wgs = [] {
+    const char* env = std::getenv("VLLM_WGS_MODEL");
+    return env && std::atoi(env) == 0;
+  }();
+
+  int gqa_ratio = std::max(1, num_heads_q / std::max(1, num_heads_kv));
+  int q_packed = gqa_ratio <= 8 ? 8 : 16;
+  // Only the kv_tile=_64 policy splits V across subgroups; when it does, one
+  // work-group owns the whole V extent and grid.x collapses to 1.  Split-V
+  // lives in the xe_2 kernels only, so on Xe3p the default policy is dispatched
+  // and this mirror must not assume the collapsed grid.
+  bool split_v = kv_tile == 64 && !vllm::xpu::is_xe3p_arch() &&
+                 vllm_xpu::decode_splits_v(head_size_qk);
+  int shapeout_v =
+      split_v ? vllm_xpu::decode_splitv_shapeout_v(q_packed, head_size_qk)
+              : vllm_xpu::decode_shapeout_v(q_packed, head_size_qk);
+  int v_splits = (v_head_dim + shapeout_v - 1) / shapeout_v;
+  int q_tiles = num_heads_kv * ((gqa_ratio + q_packed - 1) / q_packed);
+
+  int wgs_per_split = use_legacy_wgs ? batch_size * num_heads_kv
+                                     : batch_size * q_tiles * v_splits;
+
+  // Short sequences normally do not repay the ReduceSplitK overhead, but that
+  // assumes the unsplit grid already fills the machine.  Split-V makes the grid
+  // 4x smaller, so at small batch we must split anyway just to occupy the GPU.
+  if (kv_tiles < min_blocks_for_split && wgs_per_split >= num_wg_slots)
+    return 1;
 
   // Saturation guard: if the FMHA already saturates WG slots and the sequence
   // is not long enough for splitting to deliver bandwidth gains, splitting
@@ -354,6 +414,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
     int num_tokens = q.size(0);
     int batch_size = static_cast<int>(cu_seqlens_q.size(0)) - 1;
     int num_heads_q = q.size(1);
+    int head_size_qk = q.size(-1);
     int v_head_dim = v.size(-1);
     int num_heads_kv = k.size(2);
     int block_size = k.size(1);
@@ -384,7 +445,9 @@ std::vector<at::Tensor> mha_varlen_fwd(
         num_heads_q,
         num_heads_kv,
         effective_seqlen_k,
-        block_size));
+        block_size,
+        head_size_qk,
+        v_head_dim));
 
     at::Tensor tmp_out =
         num_kv_splits == 1
