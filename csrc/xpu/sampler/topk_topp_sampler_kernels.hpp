@@ -60,6 +60,7 @@ struct random_sampler_only_kernel {
       float* logits_to_return,
       float* logits,
       const int64_t* seed_offsets,
+      const bool device_shared_rng,
       const int batch_size,
       const int vocab_size,
       const int64_t seed,
@@ -69,6 +70,7 @@ struct random_sampler_only_kernel {
         logits_to_return(logits_to_return),
         logits(logits),
         seed_offsets(seed_offsets),
+        device_shared_rng(device_shared_rng),
         batch_size(batch_size),
         vocab_size(vocab_size),
         seed(seed),
@@ -93,11 +95,15 @@ struct random_sampler_only_kernel {
     const int local_id = item.get_local_linear_id();
     const int local_range = item.get_local_range(0);
 
-    const bool has_per_row_rng = seed_offsets != nullptr;
+    const bool has_per_row_rng = seed_offsets != nullptr && !device_shared_rng;
     const int64_t* row_rng =
         has_per_row_rng ? seed_offsets + batch_id * 2 : nullptr;
-    uint64_t philox_seed = has_per_row_rng ? row_rng[0] : seed;
-    uint64_t philox_offset = has_per_row_rng ? row_rng[1] : offset;
+    uint64_t philox_seed = device_shared_rng ? seed_offsets[0]
+                               : has_per_row_rng ? row_rng[0]
+                                                : seed;
+    uint64_t philox_offset = device_shared_rng ? seed_offsets[1]
+                                 : has_per_row_rng ? row_rng[1]
+                                                  : offset;
     const int philox_subsequence =
         has_per_row_rng ? local_id : item.get_global_linear_id();
     RAND::randStatePhilox4_32_10_t state;
@@ -270,6 +276,7 @@ struct random_sampler_only_kernel {
   float* logits_to_return;
   float* logits;
   const int64_t* seed_offsets;
+  const bool device_shared_rng;
   const int batch_size;
   const int vocab_size;
   const int64_t seed;
@@ -294,6 +301,7 @@ struct top_k_only_kernel {
       float* buffer,
       const int64_t* top_k,
       const int64_t* seed_offsets,
+      const bool device_shared_rng,
       const int batch_size,
       const int vocab_size,
       const int64_t seed,
@@ -305,6 +313,7 @@ struct top_k_only_kernel {
         buffer(buffer),
         top_k(top_k),
         seed_offsets(seed_offsets),
+        device_shared_rng(device_shared_rng),
         batch_size(batch_size),
         vocab_size(vocab_size),
         seed(seed),
@@ -329,11 +338,15 @@ struct top_k_only_kernel {
     const int local_id = item.get_local_linear_id();
     const int local_range = item.get_local_range(0);
 
-    const bool has_per_row_rng = seed_offsets != nullptr;
+    const bool has_per_row_rng = seed_offsets != nullptr && !device_shared_rng;
     const int64_t* row_rng =
         has_per_row_rng ? seed_offsets + batch_id * 2 : nullptr;
-    uint64_t philox_seed = has_per_row_rng ? row_rng[0] : seed;
-    uint64_t philox_offset = has_per_row_rng ? row_rng[1] : offset;
+    uint64_t philox_seed = device_shared_rng ? seed_offsets[0]
+                               : has_per_row_rng ? row_rng[0]
+                                                : seed;
+    uint64_t philox_offset = device_shared_rng ? seed_offsets[1]
+                                 : has_per_row_rng ? row_rng[1]
+                                                  : offset;
     const int philox_subsequence =
         has_per_row_rng ? local_id : item.get_global_linear_id();
     RAND::randStatePhilox4_32_10_t state;
@@ -731,6 +744,7 @@ struct top_k_only_kernel {
   float* buffer;
   const int64_t* top_k;
   const int64_t* seed_offsets;
+  const bool device_shared_rng;
   const int batch_size;
   const int vocab_size;
   const int64_t seed;
@@ -754,6 +768,7 @@ struct top_p_only_kernel {
       float* logits,
       const float* top_p,
       const int64_t* seed_offsets,
+      const bool device_shared_rng,
       const int batch_size,
       const int vocab_size,
       const int64_t seed,
@@ -764,6 +779,7 @@ struct top_p_only_kernel {
         logits(logits),
         top_p(top_p),
         seed_offsets(seed_offsets),
+        device_shared_rng(device_shared_rng),
         batch_size(batch_size),
         vocab_size(vocab_size),
         seed(seed),
@@ -788,11 +804,15 @@ struct top_p_only_kernel {
     const int local_id = item.get_local_linear_id();
     const int local_range = item.get_local_range(0);
 
-    const bool has_per_row_rng = seed_offsets != nullptr;
+    const bool has_per_row_rng = seed_offsets != nullptr && !device_shared_rng;
     const int64_t* row_rng =
         has_per_row_rng ? seed_offsets + batch_id * 2 : nullptr;
-    uint64_t philox_seed = has_per_row_rng ? row_rng[0] : seed;
-    uint64_t philox_offset = has_per_row_rng ? row_rng[1] : offset;
+    uint64_t philox_seed = device_shared_rng ? seed_offsets[0]
+                               : has_per_row_rng ? row_rng[0]
+                                                : seed;
+    uint64_t philox_offset = device_shared_rng ? seed_offsets[1]
+                                 : has_per_row_rng ? row_rng[1]
+                                                  : offset;
     const int philox_subsequence =
         has_per_row_rng ? local_id : item.get_global_linear_id();
     RAND::randStatePhilox4_32_10_t state;
@@ -1097,6 +1117,7 @@ struct top_p_only_kernel {
   float* logits;
   const float* top_p;
   const int64_t* seed_offsets;
+  const bool device_shared_rng;
   const int batch_size;
   const int vocab_size;
   const int64_t seed;
@@ -1122,6 +1143,7 @@ struct top_k_top_p_kernel {
       const int64_t* top_k,
       const float* top_p,
       const int64_t* seed_offsets,
+      const bool device_shared_rng,
       const int batch_size,
       const int vocab_size,
       const int64_t seed,
@@ -1134,6 +1156,7 @@ struct top_k_top_p_kernel {
         top_k(top_k),
         top_p(top_p),
         seed_offsets(seed_offsets),
+        device_shared_rng(device_shared_rng),
         batch_size(batch_size),
         vocab_size(vocab_size),
         seed(seed),
@@ -1158,11 +1181,15 @@ struct top_k_top_p_kernel {
     const int local_id = item.get_local_linear_id();
     const int local_range = item.get_local_range(0);
 
-    const bool has_per_row_rng = seed_offsets != nullptr;
+    const bool has_per_row_rng = seed_offsets != nullptr && !device_shared_rng;
     const int64_t* row_rng =
         has_per_row_rng ? seed_offsets + batch_id * 2 : nullptr;
-    uint64_t philox_seed = has_per_row_rng ? row_rng[0] : seed;
-    uint64_t philox_offset = has_per_row_rng ? row_rng[1] : offset;
+    uint64_t philox_seed = device_shared_rng ? seed_offsets[0]
+                               : has_per_row_rng ? row_rng[0]
+                                                : seed;
+    uint64_t philox_offset = device_shared_rng ? seed_offsets[1]
+                                 : has_per_row_rng ? row_rng[1]
+                                                  : offset;
     const int philox_subsequence =
         has_per_row_rng ? local_id : item.get_global_linear_id();
     RAND::randStatePhilox4_32_10_t state;
@@ -1654,6 +1681,7 @@ struct top_k_top_p_kernel {
   const int64_t* top_k;
   const float* top_p;
   const int64_t* seed_offsets;
+  const bool device_shared_rng;
   const int batch_size;
   const int vocab_size;
   const int64_t seed;
@@ -1671,6 +1699,7 @@ void topk_topp_sampler_kernel_launcher(
     const int64_t* top_k,
     const float* top_p,
     const int64_t* seed_offsets,
+    const bool device_shared_rng,
     const int batch_size,
     const int vocab_size,
     const int64_t seed,
@@ -1688,6 +1717,7 @@ void topk_topp_sampler_kernel_launcher(
           buffer,
           top_k,
           seed_offsets,
+          device_shared_rng,
           batch_size,
           vocab_size,
           seed,
@@ -1706,6 +1736,7 @@ void topk_topp_sampler_kernel_launcher(
           logits,
           top_p,
           seed_offsets,
+          device_shared_rng,
           batch_size,
           vocab_size,
           seed,
@@ -1726,6 +1757,7 @@ void topk_topp_sampler_kernel_launcher(
           top_k,
           top_p,
           seed_offsets,
+          device_shared_rng,
           batch_size,
           vocab_size,
           seed,
@@ -1743,6 +1775,7 @@ void topk_topp_sampler_kernel_launcher(
           logits_to_return,
           logits,
           seed_offsets,
+          device_shared_rng,
           batch_size,
           vocab_size,
           seed,
