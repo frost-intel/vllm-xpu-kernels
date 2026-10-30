@@ -27,6 +27,7 @@ void topk_topp_sampler(
       "seeds tensor must have rank 1 or 2, but got ",
       seeds.dim());
   bool has_per_row_rng = seeds.dim() == 2;
+  bool device_shared_rng = seeds.dim() == 1 && seeds.device() == logits.device();
   if (has_per_row_rng) {
     TORCH_CHECK(
         seeds.device() == logits.device(),
@@ -37,6 +38,11 @@ void topk_topp_sampler(
     TORCH_CHECK(
         seeds.size(0) == batch_size && seeds.size(1) == 2,
         "per-row seeds tensor must have shape [batch_size, 2], but got ",
+        seeds.sizes());
+  } else if (device_shared_rng) {
+    TORCH_CHECK(
+        seeds.numel() == 2,
+        "device shared seeds tensor must have shape [2], but got ",
         seeds.sizes());
   } else {
     TORCH_CHECK(
@@ -77,6 +83,8 @@ void topk_topp_sampler(
   int64_t offset = 0;
   if (has_per_row_rng) {
     seed_offsets = seeds.data_ptr<int64_t>();
+  } else if (device_shared_rng) {
+    seed_offsets = seeds.data_ptr<int64_t>();
   } else {
     auto seeds_ptr = seeds.data_ptr<int64_t>();
     seed = seeds_ptr[0];
@@ -96,6 +104,7 @@ void topk_topp_sampler(
       k.has_value() ? k->data_ptr<int64_t>() : nullptr,                  \
       p.has_value() ? p->data_ptr<float>() : nullptr,                    \
       seed_offsets,                                                      \
+      device_shared_rng,                                                 \
       batch_size,                                                        \
       vocab_size,                                                        \
       seed,                                                              \
